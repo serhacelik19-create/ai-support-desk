@@ -13,9 +13,7 @@ interface UseSocketReturn {
   isGenerating: boolean;
   sendMessage: (conversationId: string, content: string) => void;
   resolveTicket: (conversationId: string) => void;
-  triggerSimulator: () => void;
   redraft: (conversationId: string, lastMessageId: string, tone: string) => void;
-  sendSimulatorMsg: (conversationId: string, content: string) => void;
   assignTicket: (conversationId: string, userId: string | null) => void;
 }
 

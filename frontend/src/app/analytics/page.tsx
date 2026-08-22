@@ -20,6 +20,7 @@ interface AnalyticsStats {
   totalMessages: number;
   avgResponseTime: number;
   channelDistribution: { whatsapp: number; web: number };
+  dailyActivity?: { day: string; count: number }[];
 }
 
 export default function AnalyticsPage() {
@@ -28,13 +29,17 @@ export default function AnalyticsPage() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
+    let isMounted = true;
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000);
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
     setLoading(true);
     setErrorMsg(null);
 
-    const token = process.env.NEXT_PUBLIC_API_AUTH_TOKEN || "demo-auth-token-123";
+    const token =
+      (typeof window !== "undefined" && localStorage.getItem("token")) ||
+      process.env.NEXT_PUBLIC_API_AUTH_TOKEN ||
+      "demo-auth-token-123";
     fetch(`${BACKEND_URL}/api/analytics`, {
       signal: controller.signal,
       headers: {
@@ -48,32 +53,29 @@ export default function AnalyticsPage() {
         return res.json();
       })
       .then((data) => {
+        if (!isMounted) return;
         setStats(data);
+        setErrorMsg(null);
         setLoading(false);
       })
       .catch((err) => {
+        if (!isMounted) return;
         if (err.name === "AbortError") {
-          setErrorMsg("Request timed out (5s)");
+          setErrorMsg("Request timed out");
         } else {
           setErrorMsg("Failed to connect to backend analytics server");
         }
         console.error("Analytics fetch error:", err);
-        // Fallback mock data if backend analytics endpoint isn't ready
-        setStats({
-          totalConversations: 24,
-          openCount: 8,
-          resolvedCount: 16,
-          totalMessages: 142,
-          avgResponseTime: 12,
-          channelDistribution: { whatsapp: 14, web: 10 },
-        });
         setLoading(false);
       })
       .finally(() => {
-        clearTimeout(timeoutId);
+        if (isMounted) {
+          clearTimeout(timeoutId);
+        }
       });
 
     return () => {
+      isMounted = false;
       controller.abort();
       clearTimeout(timeoutId);
     };
@@ -121,7 +123,7 @@ export default function AnalyticsPage() {
           alignItems: "center",
           gap: "0.5rem"
         }}>
-          <span>⚠️ {errorMsg}. Showing fallback mock data.</span>
+          <span>⚠️ {errorMsg}</span>
         </div>
       )}
 
@@ -247,16 +249,21 @@ export default function AnalyticsPage() {
             <BarChart3 className="w-4 h-4" /> Daily Activity (Last 7 Days)
           </h3>
           <div className="mini-bar-chart">
-            {[8, 12, 6, 15, 10, 18, 14].map((val, i) => (
-              <div key={i} className="mini-bar-col">
-                <div className="mini-bar" style={{ height: `${(val / 20) * 100}%` }}>
-                  <span className="mini-bar-value">{val}</span>
+            {(stats.dailyActivity && stats.dailyActivity.length > 0
+              ? stats.dailyActivity
+              : ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((day) => ({ day, count: 0 }))
+            ).map((item, i, arr) => {
+              const maxCount = Math.max(1, ...arr.map((d) => d.count));
+              const percent = item.count > 0 ? (item.count / maxCount) * 100 : 0;
+              return (
+                <div key={i} className="mini-bar-col">
+                  <div className="mini-bar" style={{ height: `${Math.max(item.count > 0 ? percent : 6, 6)}%` }}>
+                    <span className="mini-bar-value">{item.count}</span>
+                  </div>
+                  <span className="mini-bar-label">{item.day}</span>
                 </div>
-                <span className="mini-bar-label">
-                  {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][i]}
-                </span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>

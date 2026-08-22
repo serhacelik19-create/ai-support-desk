@@ -60,7 +60,7 @@ export async function generateDraftReply(
 
   try {
     // 1. Fetch Knowledge Base entries (RAG)
-    const kbEntries = await prisma.knowledgeBase.findMany();
+    const kbEntries = (await prisma.knowledgeBase.findMany()) || [];
     const kbContext = kbEntries
       .map((entry) => `### Rule/Info: ${entry.title}\n${entry.content}`)
       .join("\n\n");

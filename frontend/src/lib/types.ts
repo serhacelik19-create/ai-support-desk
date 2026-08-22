@@ -50,4 +50,8 @@ export interface AnalyticsData {
     whatsapp: number;
     web: number;
   };
+  dailyActivity?: {
+    day: string;
+    count: number;
+  }[];
 }

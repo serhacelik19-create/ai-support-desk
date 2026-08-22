@@ -86,8 +86,16 @@ export default function ChatPanel({
 
   const handleSend = () => {
     if (!activeTicket || !replyContent.trim()) return;
+    if (activeTicket.status === "resolved") {
+      addToast("Cannot reply to a resolved ticket.", "error");
+      return;
+    }
     if (isAssignedToOther) {
       addToast("This ticket is assigned to someone else, you cannot send a message.", "error");
+      return;
+    }
+    if (isUnassigned) {
+      addToast("Please assign this ticket to yourself before replying.", "error");
       return;
     }
     onSendMessage(activeTicket.id, replyContent);
@@ -245,18 +253,37 @@ export default function ChatPanel({
       </div>
 
       {/* Quick Replies */}
-      {activeTicket.status !== "resolved" && !isAssignedToOther && (
+      {activeTicket.status !== "resolved" && isAssignedToMe && (
         <QuickReplies templates={templates} onApply={handleApplyTemplate} />
       )}
 
       {/* Input */}
-      <ChatInput
-        value={replyContent}
-        onChange={setReplyContent}
-        onSend={handleSend}
-        isResolved={activeTicket.status === "resolved" || isAssignedToOther || isUnassigned}
-        customerName={activeTicket.customer.name}
-      />
+      {(() => {
+        let isDisabled = false;
+        let disabledNotice: string | null = null;
+
+        if (activeTicket.status === "resolved") {
+          isDisabled = true;
+          disabledNotice = "This ticket has been marked as resolved.";
+        } else if (isAssignedToOther) {
+          isDisabled = true;
+          disabledNotice = `This ticket is currently assigned to ${activeTicket.assignedUser?.name || "another agent"}.`;
+        } else if (isUnassigned) {
+          isDisabled = true;
+          disabledNotice = "This ticket is currently unassigned. Please assign it to yourself before replying.";
+        }
+
+        return (
+          <ChatInput
+            value={replyContent}
+            onChange={setReplyContent}
+            onSend={handleSend}
+            isDisabled={isDisabled}
+            disabledNotice={disabledNotice}
+            customerName={activeTicket.customer.name}
+          />
+        );
+      })()}
     </section>
   );
 }

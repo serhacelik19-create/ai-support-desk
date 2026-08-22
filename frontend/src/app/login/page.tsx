@@ -159,21 +159,6 @@ export default function LoginPage() {
               )}
             </button>
 
-            <div className="login-demo-note" style={{ display: "flex", flexDirection: "column", gap: "4px", alignItems: "flex-start", marginTop: "16px", padding: "10px", background: "var(--bg-tertiary)", borderRadius: "var(--radius-sm)" }}>
-              <span style={{ fontWeight: 600, display: "flex", alignItems: "center", gap: "4px" }}>
-                <Sparkles className="w-3.5 h-3.5" style={{ color: "var(--accent)" }} />
-                Demo Account Credentials:
-              </span>
-              <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-                <strong>Admin (Owner):</strong> admin@company.com / admin123
-              </span>
-              <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-                <strong>Agent 1:</strong> temsilci1@company.com / agent123
-              </span>
-              <span style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
-                <strong>Agent 2:</strong> temsilci2@company.com / agent123
-              </span>
-            </div>
           </form>
         </div>
       </div>

@@ -7,31 +7,43 @@ interface ChatInputProps {
   value: string;
   onChange: (val: string) => void;
   onSend: () => void;
-  isResolved: boolean;
+  isDisabled?: boolean;
+  disabledNotice?: string | null;
   customerName: string;
 }
 
-export default function ChatInput({ value, onChange, onSend, isResolved, customerName }: ChatInputProps) {
+export default function ChatInput({
+  value,
+  onChange,
+  onSend,
+  isDisabled = false,
+  disabledNotice,
+  customerName,
+}: ChatInputProps) {
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      onSend();
+      if (!isDisabled && value.trim()) {
+        onSend();
+      }
     }
   };
 
   return (
     <div className="chat-input-container">
-      {isResolved && (
+      {isDisabled && disabledNotice && (
         <div className="resolved-notice">
           <Info className="w-4 h-4" />
-          This ticket has been marked as resolved.
+          {disabledNotice}
         </div>
       )}
 
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          onSend();
+          if (!isDisabled && value.trim()) {
+            onSend();
+          }
         }}
         className="chat-input-row"
       >
@@ -39,10 +51,19 @@ export default function ChatInput({ value, onChange, onSend, isResolved, custome
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={`Write message to ${customerName}...`}
+          placeholder={
+            isDisabled
+              ? "Messaging is disabled for this ticket..."
+              : `Write message to ${customerName}...`
+          }
           className="chat-textarea"
+          disabled={isDisabled}
         />
-        <button type="submit" disabled={!value.trim()} className="chat-send-btn">
+        <button
+          type="submit"
+          disabled={isDisabled || !value.trim()}
+          className="chat-send-btn"
+        >
           <Send className="w-4.5 h-4.5" />
         </button>
       </form>

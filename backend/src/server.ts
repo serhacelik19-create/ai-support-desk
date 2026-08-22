@@ -6,6 +6,7 @@ import dotenv from "dotenv";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import rateLimit from "express-rate-limit";
 import { generateDraftReply } from "./services/geminiService";
 import {
   validatePayload,
@@ -21,8 +22,49 @@ const app = express();
 const port = process.env.PORT || 5002;
 const JWT_SECRET = process.env.JWT_SECRET || "super-secret-token-key-321";
 
-app.use(cors());
+// Production CORS Configuration
+const allowedOrigins = process.env.CLIENT_ORIGIN
+  ? process.env.CLIENT_ORIGIN.split(",").map((o) => o.trim())
+  : ["http://localhost:3000", "http://localhost:3001"];
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
+
+// Rate Limiters
+export const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20, // max 20 login attempts per window per IP
+  message: { error: "Too many login attempts, please try again after 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+export const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120, // max 120 webhook calls per minute
+  message: { error: "Webhook rate limit exceeded" },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+export const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 500,
+  message: { error: "Too many API requests, please slow down." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 const authMiddleware = (
   req: express.Request,
@@ -69,7 +111,7 @@ app.get("/api/health", (req, res) => {
 });
 
 // Auth Login Endpoint
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     res.status(400).json({ error: "Email and password are required" });
@@ -264,6 +306,258 @@ app.delete("/api/knowledge/:id", authMiddleware, async (req, res) => {
   }
 });
 
+// ==========================================
+// INBOUND WEBHOOK ENDPOINTS (WhatsApp & Web)
+// ==========================================
+
+// Meta / WhatsApp Webhook Verification
+app.get("/api/webhooks/whatsapp", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN || "whatsapp-webhook-secret-token";
+
+  if (mode === "subscribe" && token === verifyToken) {
+    console.log("[Webhook] WhatsApp webhook verified successfully.");
+    res.status(200).send(challenge);
+  } else {
+    res.status(403).json({ error: "Forbidden: Verification token mismatch" });
+  }
+});
+
+// Meta / WhatsApp Incoming Message Webhook
+app.post("/api/webhooks/whatsapp", webhookLimiter, async (req, res) => {
+  try {
+    const body = req.body;
+    let from = "";
+    let customerName = "WhatsApp User";
+    let messageText = "";
+
+    // Support standard Meta Webhook payload format
+    if (body.entry && body.entry[0]?.changes && body.entry[0]?.changes[0]?.value?.messages) {
+      const msgObj = body.entry[0].changes[0].value.messages[0];
+      const contactObj = body.entry[0].changes[0].value.contacts?.[0];
+      from = msgObj.from;
+      customerName = contactObj?.profile?.name || `WhatsApp (+${from})`;
+      messageText = msgObj.text?.body || "";
+    } else if (body.from && body.text) {
+      // Direct / Simplified JSON payload
+      from = body.from;
+      customerName = body.name || `WhatsApp (+${from})`;
+      messageText = body.text;
+    } else {
+      res.status(400).json({ error: "Invalid webhook payload structure" });
+      return;
+    }
+
+    if (!messageText.trim()) {
+      res.status(200).json({ received: true, ignored: "Empty message" });
+      return;
+    }
+
+    // Find or create Customer
+    let customer = await prisma.customer.findFirst({
+      where: { name: customerName, channel: "whatsapp" },
+    });
+
+    if (!customer) {
+      customer = await prisma.customer.create({
+        data: {
+          name: customerName,
+          channel: "whatsapp",
+          avatar: `https://api.dicebear.com/7.x/adventurer/svg?seed=${encodeURIComponent(customerName)}`,
+        },
+      });
+    }
+
+    // Find open conversation or create new
+    let conversation = await prisma.conversation.findFirst({
+      where: { customerId: customer.id, status: "open" },
+      include: { messages: { orderBy: { timestamp: "asc" } }, customer: true },
+    });
+
+    let isNewTicket = false;
+    if (!conversation) {
+      isNewTicket = true;
+      conversation = await prisma.conversation.create({
+        data: {
+          customerId: customer.id,
+          status: "open",
+        },
+        include: { messages: true, customer: true },
+      });
+    }
+
+    // Create customer message
+    const message = await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        sender: "customer",
+        content: messageText,
+      },
+    });
+
+    // Update conversation updatedAt
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: { updatedAt: new Date() },
+    });
+
+    const fullHistory = [...(conversation.messages || []), message];
+
+    if (isNewTicket) {
+      const fullTicket = await prisma.conversation.findUnique({
+        where: { id: conversation.id },
+        include: {
+          customer: true,
+          assignedUser: { select: { id: true, name: true, email: true, role: true } },
+          messages: { orderBy: { timestamp: "asc" } },
+        },
+      });
+      io.emit("ticket:new", fullTicket);
+    } else {
+      io.emit("message:new", { conversationId: conversation.id, message });
+      io.to(`ticket:${conversation.id}`).emit("message:room:new", { conversationId: conversation.id, message });
+    }
+
+    // Auto-generate AI draft reply asynchronously
+    const currentSettings = getSettings();
+    generateDraftReply(fullHistory, customer.name, currentSettings.defaultTone)
+      .then(async (draft) => {
+        await prisma.message.update({
+          where: { id: message.id },
+          data: { draftReply: draft },
+        });
+        io.emit("message:draft:updated", {
+          conversationId: conversation!.id,
+          messageId: message.id,
+          draftReply: draft,
+        });
+        io.to(`ticket:${conversation!.id}`).emit("message:room:draft:updated", {
+          conversationId: conversation!.id,
+          messageId: message.id,
+          draftReply: draft,
+        });
+      })
+      .catch((err) => console.error("[WhatsApp Webhook] Draft generation error:", err));
+
+    // Run auto assignment
+    await runAutoAssignmentForUnassignedTickets();
+
+    res.json({
+      success: true,
+      conversationId: conversation.id,
+      messageId: message.id,
+    });
+  } catch (error) {
+    console.error("[WhatsApp Webhook] Processing error:", error);
+    res.status(500).json({ error: "Failed to process WhatsApp webhook" });
+  }
+});
+
+// Web Chat Widget Inbound Message Webhook
+app.post("/api/webhooks/webchat", webhookLimiter, async (req, res) => {
+  try {
+    const { customerName, message: messageText, avatar } = req.body;
+    if (!customerName || !messageText) {
+      res.status(400).json({ error: "customerName and message are required" });
+      return;
+    }
+
+    let customer = await prisma.customer.findFirst({
+      where: { name: customerName, channel: "web" },
+    });
+
+    if (!customer) {
+      customer = await prisma.customer.create({
+        data: {
+          name: customerName,
+          channel: "web",
+          avatar: avatar || `https://api.dicebear.com/7.x/adventurer/svg?seed=${encodeURIComponent(customerName)}`,
+        },
+      });
+    }
+
+    let conversation = await prisma.conversation.findFirst({
+      where: { customerId: customer.id, status: "open" },
+      include: { messages: { orderBy: { timestamp: "asc" } }, customer: true },
+    });
+
+    let isNewTicket = false;
+    if (!conversation) {
+      isNewTicket = true;
+      conversation = await prisma.conversation.create({
+        data: {
+          customerId: customer.id,
+          status: "open",
+        },
+        include: { messages: true, customer: true },
+      });
+    }
+
+    const message = await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        sender: "customer",
+        content: messageText,
+      },
+    });
+
+    await prisma.conversation.update({
+      where: { id: conversation.id },
+      data: { updatedAt: new Date() },
+    });
+
+    const fullHistory = [...(conversation.messages || []), message];
+
+    if (isNewTicket) {
+      const fullTicket = await prisma.conversation.findUnique({
+        where: { id: conversation.id },
+        include: {
+          customer: true,
+          assignedUser: { select: { id: true, name: true, email: true, role: true } },
+          messages: { orderBy: { timestamp: "asc" } },
+        },
+      });
+      io.emit("ticket:new", fullTicket);
+    } else {
+      io.emit("message:new", { conversationId: conversation.id, message });
+      io.to(`ticket:${conversation.id}`).emit("message:room:new", { conversationId: conversation.id, message });
+    }
+
+    const currentSettings = getSettings();
+    generateDraftReply(fullHistory, customer.name, currentSettings.defaultTone)
+      .then(async (draft) => {
+        await prisma.message.update({
+          where: { id: message.id },
+          data: { draftReply: draft },
+        });
+        io.emit("message:draft:updated", {
+          conversationId: conversation!.id,
+          messageId: message.id,
+          draftReply: draft,
+        });
+        io.to(`ticket:${conversation!.id}`).emit("message:room:draft:updated", {
+          conversationId: conversation!.id,
+          messageId: message.id,
+          draftReply: draft,
+        });
+      })
+      .catch((err) => console.error("[WebChat Webhook] Draft generation error:", err));
+
+    await runAutoAssignmentForUnassignedTickets();
+
+    res.json({
+      success: true,
+      conversationId: conversation.id,
+      messageId: message.id,
+    });
+  } catch (error) {
+    console.error("[WebChat Webhook] Processing error:", error);
+    res.status(500).json({ error: "Failed to process WebChat message" });
+  }
+});
+
 // Analytics endpoint — returns real calculated metrics from the database
 app.get("/api/analytics", authMiddleware, async (req, res) => {
   try {
@@ -308,6 +602,35 @@ app.get("/api/analytics", authMiddleware, async (req, res) => {
 
     const avgResponseTime = responseCount > 0 ? Math.round(totalResponseMs / responseCount / 1000) : 0;
 
+    // Real daily activity for the last 7 days from PostgreSQL database
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+    sevenDaysAgo.setHours(0, 0, 0, 0);
+
+    const recentMessages = (await prisma.message.findMany({
+      where: {
+        timestamp: { gte: sevenDaysAgo },
+      },
+      select: { timestamp: true },
+    })) || [];
+
+    const dayNames = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const dailyActivity = Array.from({ length: 7 }).map((_, idx) => {
+      const d = new Date();
+      d.setDate(d.getDate() - (6 - idx));
+      const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0);
+      const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+      const count = recentMessages.filter((m) => {
+        const t = new Date(m.timestamp).getTime();
+        return t >= dayStart.getTime() && t <= dayEnd.getTime();
+      }).length;
+
+      return {
+        day: dayNames[d.getDay()],
+        count,
+      };
+    });
+
     res.json({
       totalConversations,
       openCount,
@@ -315,6 +638,7 @@ app.get("/api/analytics", authMiddleware, async (req, res) => {
       totalMessages,
       avgResponseTime,
       channelDistribution,
+      dailyActivity,
     });
   } catch (error) {
     console.error("Error fetching analytics:", error);
@@ -324,13 +648,30 @@ app.get("/api/analytics", authMiddleware, async (req, res) => {
 
 const server = http.createServer(app);
 
-// Setup Socket.io with permissive CORS for development
+// Setup Socket.io with production-configured CORS
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: allowedOrigins.includes("*") ? "*" : allowedOrigins,
     methods: ["GET", "POST"],
+    credentials: true,
   },
 });
+
+// WebSocket In-Memory Rate Limiter Map
+const wsRateLimits = new Map<string, { redraft: number[]; message: number[] }>();
+
+function checkWsRateLimit(socketId: string, action: "redraft" | "message", limit: number, windowMs: number): boolean {
+  const now = Date.now();
+  if (!wsRateLimits.has(socketId)) {
+    wsRateLimits.set(socketId, { redraft: [], message: [] });
+  }
+  const bucket = wsRateLimits.get(socketId)![action];
+  const recent = bucket.filter((timestamp) => now - timestamp < windowMs);
+  if (recent.length >= limit) return false;
+  recent.push(now);
+  wsRateLimits.get(socketId)![action] = recent;
+  return true;
+}
 
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token;
@@ -346,17 +687,19 @@ io.use((socket, next) => {
       next(new Error("Authentication error"));
     }
   }
-});const runAutoAssignmentForUnassignedTickets = async () => {
+});
+
+const runAutoAssignmentForUnassignedTickets = async () => {
   const settings = getSettings();
   if (!settings.autoAssignment || settings.routingAlgorithm === "manual") {
     return;
   }
 
   try {
-    const unassignedConversations = await prisma.conversation.findMany({
+    const unassignedConversations = (await prisma.conversation.findMany({
       where: { status: "open", assignedUserId: null },
       orderBy: { createdAt: "asc" }
-    });
+    })) || [];
 
     if (unassignedConversations.length === 0) return;
 
@@ -368,12 +711,12 @@ io.use((socket, next) => {
       }
     });
 
-    const agents = await prisma.user.findMany({
+    const agents = (await prisma.user.findMany({
       where: { 
         role: "agent",
         id: { in: onlineUserIds }
       }
-    });
+    })) || [];
 
     if (agents.length === 0) return;
 
@@ -437,6 +780,21 @@ io.on("connection", (socket) => {
       await runAutoAssignmentForUnassignedTickets();
     }, 500);
   }
+
+  // Room Subscriptions
+  socket.on("ticket:join", (conversationId: unknown) => {
+    if (typeof conversationId === "string" && conversationId.trim()) {
+      socket.join(`ticket:${conversationId}`);
+      console.log(`[WebSocket] Socket ${socket.id} joined room ticket:${conversationId}`);
+    }
+  });
+
+  socket.on("ticket:leave", (conversationId: unknown) => {
+    if (typeof conversationId === "string" && conversationId.trim()) {
+      socket.leave(`ticket:${conversationId}`);
+      console.log(`[WebSocket] Socket ${socket.id} left room ticket:${conversationId}`);
+    }
+  });
 
   // 1. Fetch and return all conversations with their messages and customer models
   socket.on("ticket:list", async () => {
@@ -510,8 +868,12 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 3. Handle agent sending a reply (with validation)
+  // 3. Handle agent sending a reply (with validation and rate limit)
   socket.on("message:send", async (payload: unknown) => {
+    if (!checkWsRateLimit(socket.id, "message", 30, 60 * 1000)) {
+      socket.emit("error", "Rate limit exceeded: You are sending messages too quickly.");
+      return;
+    }
     const parsed = validatePayload(messageSendSchema, payload);
     if (!parsed) return;
 
@@ -532,17 +894,21 @@ io.on("connection", (socket) => {
         data: { updatedAt: new Date() },
       });
 
-      // Broadcast new message to all agents
+      // Broadcast new message to all agents and room
       io.emit("message:new", { conversationId, message });
+      io.to(`ticket:${conversationId}`).emit("message:room:new", { conversationId, message });
       console.log(`[WebSocket] Agent reply stored and broadcasted in ticket ${conversationId}`);
     } catch (error) {
       console.error("Error sending agent message:", error);
     }
   });
 
-
-  // 5. Regenerate AI draft reply with a newly selected tone (with validation)
+  // 5. Regenerate AI draft reply with rate limit
   socket.on("ai:redraft", async (payload: unknown) => {
+    if (!checkWsRateLimit(socket.id, "redraft", 12, 60 * 1000)) {
+      socket.emit("error", "Rate limit exceeded: Please wait a moment before requesting another AI draft.");
+      return;
+    }
     const parsed = validatePayload(redraftSchema, payload);
     if (!parsed) return;
 
@@ -566,27 +932,52 @@ io.on("connection", (socket) => {
         data: { draftReply: draft },
       });
 
-      // Broadcast update
+      // Broadcast update to all agents and room
       io.emit("message:draft:updated", { conversationId, messageId: lastMessageId, draftReply: draft });
+      io.to(`ticket:${conversationId}`).emit("message:room:draft:updated", { conversationId, messageId: lastMessageId, draftReply: draft });
     } catch (error) {
       console.error("Error redrafting reply:", error);
     }
   });
 
-
-
   socket.on("disconnect", () => {
+    wsRateLimits.delete(socket.id);
     console.log(`[WebSocket] Agent disconnected: ${socket.id}`);
   });
 });
 
-// Boot servers
-server.listen(port, () => {
-  console.log(`\n======================================================`);
-  console.log(`🚀 AI SUPPORT DESK BACKEND SERVER RUNNING ON PORT ${port}`);
-  console.log(`⚡ WebSocket gateway: http://localhost:${port}`);
-  console.log(`⚡ Health Endpoint:   http://localhost:${port}/api/health`);
-  console.log(`⚡ Analytics:         http://localhost:${port}/api/analytics`);
-  console.log(`======================================================\n`);
-
+// Global Express Error Handler Middleware
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error("[Express Error Handler]:", err);
+  res.status(500).json({ error: "Internal Server Error", message: err.message || "Unknown error" });
 });
+
+// Export app, server, io for testing and modularity
+export { app, server, io, prisma };
+
+// Boot servers when not in test mode
+if (process.env.NODE_ENV !== "test") {
+  server.listen(port, () => {
+    console.log(`\n======================================================`);
+    console.log(`🚀 AI SUPPORT DESK BACKEND SERVER RUNNING ON PORT ${port}`);
+    console.log(`⚡ WebSocket gateway: http://localhost:${port}`);
+    console.log(`⚡ Health Endpoint:   http://localhost:${port}/api/health`);
+    console.log(`⚡ Analytics:         http://localhost:${port}/api/analytics`);
+    console.log(`⚡ Webhooks:          http://localhost:${port}/api/webhooks/whatsapp`);
+    console.log(`======================================================\n`);
+  });
+}
+
+// Graceful Process Shutdown
+const shutdown = async () => {
+  console.log("\n[Server] Graceful shutdown initiated...");
+  server.close(async () => {
+    console.log("[Server] HTTP and WebSocket servers closed.");
+    await prisma.$disconnect();
+    console.log("[Server] Database connection closed.");
+    process.exit(0);
+  });
+};
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
